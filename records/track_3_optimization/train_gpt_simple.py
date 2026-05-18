@@ -303,11 +303,6 @@ for _ in range(num_trials):
     decor_lambda_a   = 1.0
     decor_lambda_c   = 0.01
     decor_fisher_eps = 1e-3
-    # Memory levers: fewer/smaller environments reduce the activation graph kept
-    # alive by create_graph=True.  Each env holds a (decor_mbs,1024,50304) bf16
-    # logit buffer (~decor_mbs/64 * 6.5 GB) plus all upstream activations.
-    decor_num_envs   = 4   # K; must be >= 2 for a non-trivial alignment term
-    decor_mbs        = 64  # sequences per DECOR2 environment (< mbs is fine)
 
     # learning rate schedule: stable then decay
     def set_hparams(step, cooldown_frac=0.7):
@@ -326,7 +321,7 @@ for _ in range(num_trials):
     #        Training and Validation       #
     ########################################
 
-    train_loader = distributed_data_generator("/var/local/storage/aballas/fineweb10B/fineweb_train_*.bin", batch_size)
+    train_loader = distributed_data_generator("/var/local/storage/fineweb10B/fineweb_train_*.bin", batch_size)
     for p in model.parameters():
         dist.broadcast(p.detach(), 0)
     # start the clock
@@ -366,8 +361,7 @@ for _ in range(num_trials):
         # --------------- TRAINING SECTION (DECOR2) -----------------
         inputs, targets = next(train_loader)
         assert len(inputs) % mbs == 0
-        K = decor_num_envs
-        assert K * decor_mbs <= len(inputs), "decor_num_envs * decor_mbs exceeds local batch"
+        K = len(inputs) // mbs  # each microbatch is one "environment"
 
         params = [p for p in model.parameters() if p.requires_grad]
 
@@ -375,9 +369,9 @@ for _ in range(num_trials):
         per_env_losses = []
         G_cols = []
         for k in range(K):
-            x_k = inputs[k*decor_mbs:(k+1)*decor_mbs]
-            y_k = targets[k*decor_mbs:(k+1)*decor_mbs]
-            loss_k = model.forward(x_k, y_k) / decor_mbs
+            x_k = inputs[k*mbs:(k+1)*mbs]
+            y_k = targets[k*mbs:(k+1)*mbs]
+            loss_k = model(x_k, y_k) / mbs
             per_env_losses.append(loss_k)
             grads_k = torch.autograd.grad(
                 loss_k, params,
