@@ -377,7 +377,7 @@ for _ in range(num_trials):
         for k in range(K):
             x_k = inputs[k*decor_mbs:(k+1)*decor_mbs]
             y_k = targets[k*decor_mbs:(k+1)*decor_mbs]
-            loss_k = model(x_k, y_k) / decor_mbs
+            loss_k = model.forward(x_k, y_k) / decor_mbs
             per_env_losses.append(loss_k)
             grads_k = torch.autograd.grad(
                 loss_k, params,
