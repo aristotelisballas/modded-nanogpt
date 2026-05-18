@@ -13,6 +13,8 @@ import uuid
 import time
 from pathlib import Path
 
+import itertools
+
 import torch
 from torch import Tensor, nn
 from torch.optim import AdamW
@@ -297,6 +299,11 @@ for _ in range(num_trials):
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
 
+    # DECOR2 hyperparameters
+    decor_lambda_a   = 1.0
+    decor_lambda_c   = 0.01
+    decor_fisher_eps = 1e-3
+
     # learning rate schedule: stable then decay
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
@@ -351,22 +358,97 @@ for _ in range(num_trials):
         if step == train_steps:
             break
 
-        # --------------- TRAINING SECTION -----------------
+        # --------------- TRAINING SECTION (DECOR2) -----------------
         inputs, targets = next(train_loader)
-        # accumulate across microbatches in case we are running with fewer than 8 gpus
         assert len(inputs) % mbs == 0
-        for i in range(len(inputs) // mbs):
-            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        K = len(inputs) // mbs  # each microbatch is one "environment"
+
+        params = [p for p in model.parameters() if p.requires_grad]
+
+        # --- Per-environment forward passes + differentiable gradients ----------
+        per_env_losses = []
+        G_cols = []
+        for k in range(K):
+            x_k = inputs[k*mbs:(k+1)*mbs]
+            y_k = targets[k*mbs:(k+1)*mbs]
+            loss_k = model(x_k, y_k) / mbs
+            per_env_losses.append(loss_k)
+            grads_k = torch.autograd.grad(
+                loss_k, params,
+                create_graph=True, retain_graph=True, allow_unused=True,
+            )
+            grads_k = [g if g is not None else torch.zeros_like(p)
+                       for g, p in zip(grads_k, params)]
+            G_cols.append(torch.cat([g.reshape(-1) for g in grads_k]))
+
+        # --- Gram matrix M (K x K), differentiable in theta --------------------
+        M = torch.stack([
+            torch.stack([torch.dot(G_cols[k], G_cols[l]) for l in range(K)])
+            for k in range(K)
+        ])
+
+        # --- Curvature term: tr(H_bar) ≈ (1/K) * tr(M) -----------------------
+        curv_term = torch.diagonal(M).mean()
+
+        # --- Alignment term via Woodbury with scale-relative regularisation ----
+        # alpha is a multiplier of the mean diagonal of M so it stays
+        # commensurate with M's eigenvalue scale (avoids the trivial K-1 collapse).
+        M_scale  = torch.diagonal(M).mean().detach()
+        alpha    = decor_fisher_eps * M_scale
+        eye_K    = torch.eye(K, device=M.device, dtype=M.dtype)
+        ones_KK  = torch.ones(K, K, device=M.device, dtype=M.dtype)
+        C        = eye_K - ones_KK / K
+        CMC      = C @ M @ C
+        CM       = C @ M
+        MC       = M @ C
+        A        = alpha * K * eye_K + M
+        sol      = torch.linalg.solve(A, MC)
+        align_term = (torch.trace(CMC) - torch.trace(CM @ sol)) / (alpha * K)
+
+        # --- ERM loss + DECOR2 regularisation ----------------------------------
+        erm_loss = torch.stack(per_env_losses).mean()
+        loss     = erm_loss + decor_lambda_c * curv_term + decor_lambda_a * align_term
+
+        # --- Diagnostics (no grad) ---------------------------------------------
+        with torch.no_grad():
+            M_det     = M.detach()
+            eigvals_M = torch.linalg.eigvalsh(M_det)
+            avg_sim   = 1.0
+            per_domain_sims = {}
+            if K > 1:
+                norms   = torch.sqrt(torch.diagonal(M_det).clamp_min(1e-12))
+                cos_mat = M_det / (norms.unsqueeze(0) * norms.unsqueeze(1))
+                pairs   = list(itertools.combinations(range(K), 2))
+                avg_sim = torch.stack([cos_mat[i, j] for i, j in pairs]).mean().item()
+                for i in range(K):
+                    sims_i = [cos_mat[i, j].item() for j in range(K) if j != i]
+                    per_domain_sims[f"gradient_sim_domain_{i}"] = sum(sims_i) / len(sims_i)
+
+        # --- Backward and optimizer step ---------------------------------------
+        for opt in optimizers:
+            opt.zero_grad()
+        loss.backward()
         for name, p in model.named_parameters():
             assert p.grad is not None, name
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-        # set optimization hyperparameters and take a step
         set_hparams(step)
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
+
         approx_training_time = training_time + (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+        alpha_eff = alpha.item()
+        print0(
+            f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+            + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms"
+            + f" erm:{erm_loss.item():.4f} total:{loss.item():.4f}"
+            + f" curv:{curv_term.item():.4f} align:{align_term.item():.4f}"
+            + f" align_minus_trivial:{align_term.item() - (K - 1):.4f}"
+            + f" M_diag_mean:{M_scale.item():.4e} M_min_eig:{eigvals_M.min().item():.4e}"
+            + f" M_max_eig:{eigvals_M.max().item():.4e} alpha_eff:{alpha_eff:.4e}"
+            + f" alphaK_over_meanEig:{alpha_eff * K / (M_scale.item() + 1e-12):.4f}"
+            + f" grad_sim:{avg_sim:.4f}",
+            console=True, log=False
+        )
 
 dist.destroy_process_group()
