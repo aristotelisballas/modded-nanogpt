@@ -71,7 +71,8 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    files = sorted(Path.cwd().glob(filename_pattern))
+    pattern = Path(filename_pattern)
+    files = sorted(pattern.parent.glob(pattern.name))
     assert batch_size % dist.get_world_size() == 0
     local_batch_size = batch_size // dist.get_world_size()
     file_iter = iter(files)
