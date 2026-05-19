@@ -397,7 +397,7 @@ for _ in range(num_trials):
             n_tok = inputs_k[k].numel()
             (model(inputs_k[k], targets_k[k]) / n_tok).backward()
             gk = torch.cat([
-                p.grad.float() if p.grad is not None
+                p.grad.reshape(-1).float() if p.grad is not None
                 else torch.zeros(p.numel(), dtype=torch.float32, device=p.device)
                 for p in params
             ]).detach().clone()
@@ -459,7 +459,7 @@ for _ in range(num_trials):
             for i in range(len(inputs) // mbs):
                 model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
             g = torch.cat([
-                p.grad.float() if p.grad is not None
+                p.grad.reshape(-1).float() if p.grad is not None
                 else torch.zeros(p.numel(), dtype=torch.float32, device=p.device)
                 for p in params
             ])
